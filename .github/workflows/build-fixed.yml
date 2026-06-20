@@ -1,0 +1,60 @@
+name: Build Caller Announcer APK Fixed
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build debug APK fixed
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Extract embedded Android project from old workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          awk '
+            /      - name: Write embedded Android project/ { found=1; next }
+            found && /      - name: Build debug APK/ { exit }
+            found && /^        shell: bash/ { next }
+            found && /^        run: \|/ { inrun=1; next }
+            found && inrun { sub(/^          /, ""); print }
+          ' .github/workflows/build.yml > /tmp/write-project.sh
+          bash /tmp/write-project.sh
+          test -f settings.gradle.kts
+          test -f app/build.gradle.kts
+
+      - name: Set up Gradle 8.10.2
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: '8.10.2'
+          cache-provider: basic
+
+      - name: Build debug APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          gradle :app:assembleDebug --no-daemon --stacktrace
+          mkdir -p out
+          cp app/build/outputs/apk/debug/app-debug.apk out/CallerAnnouncer-debug.apk
+          ls -lh out/CallerAnnouncer-debug.apk
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CallerAnnouncer-debug-apk
+          path: out/CallerAnnouncer-debug.apk
+          retention-days: 14
