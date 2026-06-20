@@ -1,0 +1,895 @@
+name: Build Caller Announcer APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build debug APK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle 8.10.2
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: '8.10.2'
+          cache-provider: basic
+
+      - name: Write embedded Android project
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .
+          cat > settings.gradle.kts <<'__CALLER_ANNOUNCER_FILE__'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          
+          rootProject.name = "CallerAnnouncer"
+          include(":app")
+          __CALLER_ANNOUNCER_FILE__
+
+          mkdir -p .
+          cat > build.gradle.kts <<'__CALLER_ANNOUNCER_FILE__'
+          plugins {
+              id("com.android.application") version "8.7.3" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+          }
+          __CALLER_ANNOUNCER_FILE__
+
+          mkdir -p .
+          cat > gradle.properties <<'__CALLER_ANNOUNCER_FILE__'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=false
+          android.nonTransitiveRClass=true
+          kotlin.code.style=official
+          __CALLER_ANNOUNCER_FILE__
+
+          mkdir -p app
+          cat > app/build.gradle.kts <<'__CALLER_ANNOUNCER_FILE__'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          
+          android {
+              namespace = "dev.callerannouncer"
+              compileSdk = 35
+          
+              defaultConfig {
+                  applicationId = "dev.callerannouncer"
+                  minSdk = 26
+                  targetSdk = 35
+                  versionCode = 1
+                  versionName = "1.0.0"
+              }
+          
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+          
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+          
+          dependencies {
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
+          }
+          __CALLER_ANNOUNCER_FILE__
+
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'__CALLER_ANNOUNCER_FILE__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+          
+              <!-- Required to verify phone state before speaking and for the PHONE_STATE receiver fallback. -->
+              <uses-permission android:name="android.permission.READ_PHONE_STATE" />
+          
+              <!-- Required to turn a phone number into a saved contact display name. -->
+              <uses-permission android:name="android.permission.READ_CONTACTS" />
+          
+              <!-- Optional fallback for TelephonyManager.EXTRA_INCOMING_NUMBER. On modern Android this is hard-restricted, so the CallScreeningService role is the primary path. -->
+              <uses-permission android:name="android.permission.READ_CALL_LOG" />
+          
+              <!-- Lets MainActivity ask the user to exempt the app from Doze/App Standby. -->
+              <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+          
+              <uses-feature
+                  android:name="android.hardware.telephony"
+                  android:required="false" />
+          
+              <application
+                  android:name=".CallerAnnouncerApp"
+                  android:allowBackup="false"
+                  android:label="@string/app_name"
+                  android:supportsRtl="true"
+                  android:theme="@style/AppTheme">
+          
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+          
+                  <service
+                      android:name=".AnnouncerCallScreeningService"
+                      android:permission="android.permission.BIND_SCREENING_SERVICE"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.telecom.CallScreeningService" />
+                      </intent-filter>
+                  </service>
+          
+                  <receiver
+                      android:name=".CallReceiver"
+                      android:enabled="true"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.PHONE_STATE" />
+                      </intent-filter>
+                  </receiver>
+              </application>
+          </manifest>
+          __CALLER_ANNOUNCER_FILE__
+
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'__CALLER_ANNOUNCER_FILE__'
+          <resources>
+              <string name="app_name">Caller Announcer</string>
+          </resources>
+          __CALLER_ANNOUNCER_FILE__
+
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/styles.xml <<'__CALLER_ANNOUNCER_FILE__'
+          <resources>
+              <style name="AppTheme" parent="android:style/Theme.Material.Light.NoActionBar">
+                  <item name="android:fontFamily">sans</item>
+                  <item name="android:windowLightStatusBar">true</item>
+                  <item name="android:windowLightNavigationBar">true</item>
+                  <item name="android:colorAccent">#263238</item>
+              </style>
+          </resources>
+          __CALLER_ANNOUNCER_FILE__
+
+          mkdir -p app/src/main/java/dev/callerannouncer
+          cat > app/src/main/java/dev/callerannouncer/AnnouncerCallScreeningService.kt <<'__CALLER_ANNOUNCER_FILE__'
+          package dev.callerannouncer
+          
+          import android.os.Build
+          import android.telecom.Call
+          import android.telecom.CallScreeningService
+          
+          class AnnouncerCallScreeningService : CallScreeningService() {
+              override fun onScreenCall(callDetails: Call.Details) {
+                  // We are not blocking, rejecting, silencing, or modifying the call. The service is used
+                  // only to receive the verified incoming handle on modern Android.
+                  respondToCall(callDetails, CallResponse.Builder().build())
+          
+                  val isIncoming = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                      callDetails.callDirection == Call.Details.DIRECTION_INCOMING
+                  } else {
+                      true
+                  }
+                  if (!isIncoming) return
+          
+                  val number = callDetails.handle?.schemeSpecificPart.orEmpty().trim()
+                  if (number.isBlank()) return // Private/unknown caller: strict silent mode.
+          
+                  CallerAnnouncementScheduler.schedule(
+                      context = applicationContext,
+                      incomingNumber = number,
+                      source = "call-screening"
+                  )
+              }
+          }
+          __CALLER_ANNOUNCER_FILE__
+
+          mkdir -p app/src/main/java/dev/callerannouncer
+          cat > app/src/main/java/dev/callerannouncer/CallReceiver.kt <<'__CALLER_ANNOUNCER_FILE__'
+          package dev.callerannouncer
+          
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+          import android.telephony.TelephonyManager
+          
+          class CallReceiver : BroadcastReceiver() {
+              override fun onReceive(context: Context, intent: Intent) {
+                  if (intent.action != TelephonyManager.ACTION_PHONE_STATE_CHANGED) return
+          
+                  when (intent.getStringExtra(TelephonyManager.EXTRA_STATE)) {
+                      TelephonyManager.EXTRA_STATE_RINGING -> handleRinging(context.applicationContext, intent)
+                      TelephonyManager.EXTRA_STATE_OFFHOOK,
+                      TelephonyManager.EXTRA_STATE_IDLE -> CallerAnnouncementScheduler.reset()
+                  }
+              }
+          
+              private fun handleRinging(context: Context, intent: Intent) {
+                  // Modern Android usually withholds this extra unless READ_CALL_LOG is allowlisted.
+                  // This receiver is therefore a fallback; CallScreeningService is the primary path.
+                  if (!intent.hasExtra(TelephonyManager.EXTRA_INCOMING_NUMBER)) return
+          
+                  val incomingNumber = intent.getStringExtra(TelephonyManager.EXTRA_INCOMING_NUMBER).orEmpty().trim()
+                  if (incomingNumber.isBlank()) return // Private/unknown caller: strict silent mode.
+                  if (!PermissionGate.hasRequiredRuntimePermissions(context)) return
+          
+                  val pendingResult = goAsync()
+                  CallerAnnouncementScheduler.schedule(
+                      context = context,
+                      incomingNumber = incomingNumber,
+                      source = "phone-state",
+                      completion = { pendingResult.finish() }
+                  )
+              }
+          }
+          __CALLER_ANNOUNCER_FILE__
+
+          mkdir -p app/src/main/java/dev/callerannouncer
+          cat > app/src/main/java/dev/callerannouncer/CallerAnnouncementScheduler.kt <<'__CALLER_ANNOUNCER_FILE__'
+          package dev.callerannouncer
+          
+          import android.Manifest
+          import android.content.Context
+          import android.content.pm.PackageManager
+          import android.os.Build
+          import android.os.SystemClock
+          import android.telephony.TelephonyManager
+          import android.util.Log
+          import kotlinx.coroutines.CoroutineScope
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.SupervisorJob
+          import kotlinx.coroutines.async
+          import kotlinx.coroutines.delay
+          import kotlinx.coroutines.launch
+          import java.util.concurrent.atomic.AtomicLong
+          
+          object CallerAnnouncementScheduler {
+              private const val TAG = "CallerAnnouncement"
+              private const val ONE_SECOND_MS = 1000L
+              private const val DEDUPE_WINDOW_MS = 5000L
+          
+              private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+              private val nextEventId = AtomicLong(0L)
+              private val lock = Any()
+          
+              private var lastAnnouncementKey: String? = null
+              private var lastAnnouncementAt: Long = 0L
+          
+              fun schedule(
+                  context: Context,
+                  incomingNumber: String,
+                  source: String,
+                  completion: (() -> Unit)? = null
+              ) {
+                  val appContext = context.applicationContext
+                  val number = incomingNumber.trim()
+                  if (number.isBlank()) {
+                      completion?.invoke()
+                      return
+                  }
+                  if (!PermissionGate.hasRequiredRuntimePermissions(appContext)) {
+                      completion?.invoke()
+                      return
+                  }
+          
+                  val key = number
+                  @Suppress("UNUSED_VARIABLE") val announcementSource = source
+                  val now = SystemClock.elapsedRealtime()
+                  synchronized(lock) {
+                      if (lastAnnouncementKey == key && now - lastAnnouncementAt < DEDUPE_WINDOW_MS) {
+                          completion?.invoke()
+                          return
+                      }
+                      lastAnnouncementKey = key
+                      lastAnnouncementAt = now
+                  }
+          
+                  val eventId = nextEventId.incrementAndGet()
+                  scope.launch {
+                      try {
+                          val startedAt = SystemClock.elapsedRealtime()
+                          val contactNameDeferred = async(Dispatchers.IO) {
+                              ContactLookup.displayNameForNumber(appContext, number)
+                          }
+          
+                          val contactName = contactNameDeferred.await()?.trim()
+                          val elapsed = SystemClock.elapsedRealtime() - startedAt
+                          val remainingDelay = ONE_SECOND_MS - elapsed
+                          if (remainingDelay > 0L) delay(remainingDelay)
+          
+                          if (!isStillLatest(eventId, key)) return@launch
+                          if (!isStillRinging(appContext)) return@launch
+          
+                          // Strict output: saved contact name only. No raw digits, no filler phrase.
+                          if (!contactName.isNullOrBlank()) {
+                              CallerSpeaker.speakName(appContext, contactName)
+                          }
+                      } catch (t: Throwable) {
+                          Log.w(TAG, "Caller announcement failed", t)
+                      } finally {
+                          completion?.invoke()
+                      }
+                  }
+              }
+          
+              fun reset() {
+                  synchronized(lock) {
+                      lastAnnouncementKey = null
+                      lastAnnouncementAt = 0L
+                  }
+                  CallerSpeaker.stop()
+              }
+          
+              private fun isStillLatest(eventId: Long, key: String): Boolean = synchronized(lock) {
+                  eventId == nextEventId.get() && lastAnnouncementKey == key
+              }
+          
+              private fun isStillRinging(context: Context): Boolean {
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
+                      context.checkSelfPermission(Manifest.permission.READ_PHONE_STATE) != PackageManager.PERMISSION_GRANTED
+                  ) return false
+          
+                  val telephonyManager = context.getSystemService(TelephonyManager::class.java) ?: return false
+                  return runCatching {
+                      @Suppress("DEPRECATION")
+                      telephonyManager.callState == TelephonyManager.CALL_STATE_RINGING
+                  }.getOrDefault(false)
+              }
+          }
+          __CALLER_ANNOUNCER_FILE__
+
+          mkdir -p app/src/main/java/dev/callerannouncer
+          cat > app/src/main/java/dev/callerannouncer/CallerAnnouncerApp.kt <<'__CALLER_ANNOUNCER_FILE__'
+          package dev.callerannouncer
+          
+          import android.app.Application
+          
+          class CallerAnnouncerApp : Application() {
+              override fun onCreate() {
+                  super.onCreate()
+                  CallerSpeaker.warmUp(this)
+              }
+          
+              override fun onTerminate() {
+                  CallerSpeaker.shutdown()
+                  super.onTerminate()
+              }
+          }
+          __CALLER_ANNOUNCER_FILE__
+
+          mkdir -p app/src/main/java/dev/callerannouncer
+          cat > app/src/main/java/dev/callerannouncer/CallerSpeaker.kt <<'__CALLER_ANNOUNCER_FILE__'
+          package dev.callerannouncer
+          
+          import android.content.Context
+          import android.media.AudioAttributes
+          import android.media.AudioFocusRequest
+          import android.media.AudioManager
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.os.SystemClock
+          import android.speech.tts.TextToSpeech
+          import android.speech.tts.UtteranceProgressListener
+          import android.util.Log
+          import java.util.Locale
+          
+          object CallerSpeaker {
+              private const val TAG = "CallerSpeaker"
+              private val mainHandler = Handler(Looper.getMainLooper())
+              private val lock = Any()
+              private val pendingCallbacks = mutableListOf<(TextToSpeech) -> Unit>()
+          
+              @Volatile private var tts: TextToSpeech? = null
+              @Volatile private var initInProgress = false
+          
+              private var audioManager: AudioManager? = null
+              private var focusRequest: AudioFocusRequest? = null
+          
+              fun warmUp(context: Context) {
+                  withTts(context.applicationContext) { /* Intentionally keep engine initialized. */ }
+              }
+          
+              fun speakName(context: Context, rawName: String) {
+                  val name = rawName.trim()
+                  if (name.isBlank()) return
+          
+                  val appContext = context.applicationContext
+                  mainHandler.post {
+                      requestAudioFocus(appContext)
+                      withTts(appContext) { engine ->
+                          val params = Bundle().apply {
+                              putInt(TextToSpeech.Engine.KEY_PARAM_STREAM, AudioManager.STREAM_RING)
+                              putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, 1.0f)
+                          }
+                          val result = engine.speak(
+                              name,
+                              TextToSpeech.QUEUE_FLUSH,
+                              params,
+                              "caller-name-${SystemClock.uptimeMillis()}"
+                          )
+                          if (result != TextToSpeech.SUCCESS) {
+                              Log.w(TAG, "TextToSpeech.speak returned $result")
+                              abandonAudioFocus()
+                          }
+                      }
+                  }
+              }
+          
+              fun stop() {
+                  mainHandler.post {
+                      tts?.stop()
+                      abandonAudioFocus()
+                  }
+              }
+          
+              fun shutdown() {
+                  mainHandler.post {
+                      synchronized(lock) {
+                          pendingCallbacks.clear()
+                          initInProgress = false
+                      }
+                      tts?.runCatching { stop() }
+                      tts?.runCatching { shutdown() }
+                      tts = null
+                      abandonAudioFocus()
+                  }
+              }
+          
+              private fun withTts(context: Context, callback: (TextToSpeech) -> Unit) {
+                  val existing = tts
+                  if (existing != null) {
+                      callback(existing)
+                      return
+                  }
+          
+                  synchronized(lock) {
+                      pendingCallbacks += callback
+                      if (initInProgress) return
+                      initInProgress = true
+                  }
+          
+                  var createdEngine: TextToSpeech? = null
+                  createdEngine = TextToSpeech(context.applicationContext) { status ->
+                      mainHandler.post {
+                          val callbacks: List<(TextToSpeech) -> Unit>
+                          val engine = createdEngine
+          
+                          synchronized(lock) {
+                              initInProgress = false
+                              callbacks = if (status == TextToSpeech.SUCCESS && engine != null) {
+                                  tts = engine
+                                  pendingCallbacks.toList().also { pendingCallbacks.clear() }
+                              } else {
+                                  pendingCallbacks.clear()
+                                  emptyList()
+                              }
+                          }
+          
+                          if (status == TextToSpeech.SUCCESS && engine != null) {
+                              configureEngine(engine)
+                              callbacks.forEach { it(engine) }
+                          } else {
+                              Log.w(TAG, "TextToSpeech initialization failed with status $status")
+                              engine?.runCatching { shutdown() }
+                              abandonAudioFocus()
+                          }
+                      }
+                  }
+              }
+          
+              private fun configureEngine(engine: TextToSpeech) {
+                  engine.setLanguage(Locale.getDefault())
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                      val attributes = AudioAttributes.Builder()
+                          .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
+                          .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                          .build()
+                      engine.setAudioAttributes(attributes)
+                  }
+                  engine.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                      override fun onStart(utteranceId: String) = Unit
+          
+                      override fun onDone(utteranceId: String) {
+                          finishSpeechSoon()
+                      }
+          
+                      @Deprecated("Deprecated in Java")
+                      override fun onError(utteranceId: String) {
+                          finishSpeechSoon()
+                      }
+          
+                      override fun onError(utteranceId: String, errorCode: Int) {
+                          finishSpeechSoon()
+                      }
+          
+                      override fun onStop(utteranceId: String, interrupted: Boolean) {
+                          finishSpeechSoon()
+                      }
+                  })
+              }
+          
+              private fun requestAudioFocus(context: Context) {
+                  val manager = context.getSystemService(AudioManager::class.java) ?: return
+                  audioManager = manager
+          
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      val attributes = AudioAttributes.Builder()
+                          .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
+                          .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                          .build()
+                      val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+                          .setAudioAttributes(attributes)
+                          .setWillPauseWhenDucked(false)
+                          .setOnAudioFocusChangeListener { /* TTS is one short utterance; no queue handling needed. */ }
+                          .build()
+                      focusRequest = request
+                      manager.requestAudioFocus(request)
+                  } else {
+                      @Suppress("DEPRECATION")
+                      manager.requestAudioFocus(
+                          null,
+                          AudioManager.STREAM_RING,
+                          AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK
+                      )
+                  }
+              }
+          
+              private fun finishSpeechSoon() {
+                  mainHandler.postDelayed({ abandonAudioFocus() }, 300L)
+              }
+          
+              private fun abandonAudioFocus() {
+                  val manager = audioManager ?: return
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      focusRequest?.let(manager::abandonAudioFocusRequest)
+                      focusRequest = null
+                  } else {
+                      @Suppress("DEPRECATION")
+                      manager.abandonAudioFocus(null)
+                  }
+              }
+          }
+          __CALLER_ANNOUNCER_FILE__
+
+          mkdir -p app/src/main/java/dev/callerannouncer
+          cat > app/src/main/java/dev/callerannouncer/ContactLookup.kt <<'__CALLER_ANNOUNCER_FILE__'
+          package dev.callerannouncer
+          
+          import android.Manifest
+          import android.content.Context
+          import android.content.pm.PackageManager
+          import android.net.Uri
+          import android.os.Build
+          import android.provider.ContactsContract
+          
+          object ContactLookup {
+              fun displayNameForNumber(context: Context, phoneNumber: String): String? {
+                  if (phoneNumber.isBlank()) return null
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
+                      context.checkSelfPermission(Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED
+                  ) return null
+          
+                  val uri = Uri.withAppendedPath(
+                      ContactsContract.PhoneLookup.CONTENT_FILTER_URI,
+                      Uri.encode(phoneNumber)
+                  )
+          
+                  val projection = arrayOf(
+                      ContactsContract.PhoneLookup.DISPLAY_NAME_PRIMARY,
+                      ContactsContract.PhoneLookup.DISPLAY_NAME
+                  )
+          
+                  return runCatching {
+                      context.contentResolver.query(uri, projection, null, null, null)?.use { cursor ->
+                          if (!cursor.moveToFirst()) return null
+          
+                          val primaryIndex = cursor.getColumnIndex(ContactsContract.PhoneLookup.DISPLAY_NAME_PRIMARY)
+                          val fallbackIndex = cursor.getColumnIndex(ContactsContract.PhoneLookup.DISPLAY_NAME)
+          
+                          val primary = primaryIndex.takeIf { it >= 0 }?.let(cursor::getString)?.trim()
+                          val fallback = fallbackIndex.takeIf { it >= 0 }?.let(cursor::getString)?.trim()
+          
+                          primary?.takeIf(String::isNotBlank) ?: fallback?.takeIf(String::isNotBlank)
+                      }
+                  }.getOrNull()
+              }
+          }
+          __CALLER_ANNOUNCER_FILE__
+
+          mkdir -p app/src/main/java/dev/callerannouncer
+          cat > app/src/main/java/dev/callerannouncer/MainActivity.kt <<'__CALLER_ANNOUNCER_FILE__'
+          package dev.callerannouncer
+          
+          import android.app.Activity
+          import android.app.role.RoleManager
+          import android.content.ActivityNotFoundException
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.PowerManager
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.view.ViewGroup
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          
+          class MainActivity : Activity() {
+              private lateinit var statusView: TextView
+          
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  CallerSpeaker.warmUp(applicationContext)
+                  setContentView(createContentView())
+                  updateStatus()
+              }
+          
+              override fun onResume() {
+                  super.onResume()
+                  updateStatus()
+              }
+          
+              override fun onRequestPermissionsResult(
+                  requestCode: Int,
+                  permissions: Array<out String>,
+                  grantResults: IntArray
+              ) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+                  updateStatus()
+              }
+          
+              private fun createContentView(): ScrollView {
+                  val density = resources.displayMetrics.density
+                  fun dp(value: Int) = (value * density).toInt()
+          
+                  val container = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER_HORIZONTAL
+                      setPadding(dp(20), dp(24), dp(20), dp(24))
+                      layoutParams = ViewGroup.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT,
+                          ViewGroup.LayoutParams.WRAP_CONTENT
+                      )
+                  }
+          
+                  val title = TextView(this).apply {
+                      text = "Caller Announcer"
+                      textSize = 24f
+                      gravity = Gravity.CENTER
+                  }
+                  container.addView(title, matchWrap())
+          
+                  statusView = TextView(this).apply {
+                      textSize = 15f
+                      setPadding(0, dp(18), 0, dp(18))
+                  }
+                  container.addView(statusView, matchWrap())
+          
+                  container.addView(button("Grant required permissions") { requestRequiredPermissions() }, matchWrap())
+                  container.addView(button("Set as Call Screening app") { requestCallScreeningRole() }, matchWrap())
+                  container.addView(button("Try grant Call Log fallback") { requestOptionalCallLogPermission() }, matchWrap())
+                  container.addView(button("Test TTS: say Sarah") { CallerSpeaker.speakName(this, "Sarah") }, matchWrap())
+                  container.addView(button("Allow unrestricted battery use") { requestBatteryOptimizationExemption() }, matchWrap())
+                  container.addView(button("Open this app's settings") { openAppSettings() }, matchWrap())
+          
+                  val instructions = TextView(this).apply {
+                      textSize = 14f
+                      setPadding(0, dp(18), 0, 0)
+                      text = "Setup for Honor / MagicOS:\n" +
+                          "1. Grant Phone and Contacts permissions.\n" +
+                          "2. Set this app as the Call Screening app. This is the modern Android path for receiving the incoming number without replacing your dialer.\n" +
+                          "3. Allow unrestricted battery use.\n" +
+                          "4. In MagicOS App Launch/Battery settings, disable automatic management for this app and allow auto launch, secondary launch, and background running.\n\n" +
+                          "Behavior:\n" +
+                          "• Incoming saved contact: after a 1-second minimum delay, speaks only the saved contact name.\n" +
+                          "• Unknown/private caller or missing contact: silent.\n" +
+                          "• No phrase such as 'incoming call from' is ever spoken."
+                  }
+                  container.addView(instructions, matchWrap())
+          
+                  return ScrollView(this).apply { addView(container) }
+              }
+          
+              private fun updateStatus() {
+                  val missingRequired = PermissionGate.missingRequired(this)
+                  val callLogStatus = if (PermissionGate.hasCallLogPermission(this)) "granted" else "not granted / may be restricted"
+                  val batteryStatus = if (isIgnoringBatteryOptimizations()) "allowed" else "not allowed yet"
+                  val screeningStatus = when {
+                      Build.VERSION.SDK_INT < Build.VERSION_CODES.Q -> "not available before Android 10"
+                      !isCallScreeningRoleAvailable() -> "not available on this device"
+                      isCallScreeningRoleHeld() -> "enabled"
+                      else -> "not enabled"
+                  }
+                  statusView.text = buildString {
+                      append("Required runtime permissions: ")
+                      append(if (missingRequired.isEmpty()) "granted" else "missing ${missingRequired.joinToString { it.substringAfterLast('.') }}")
+                      append('\n')
+                      append("Call Screening role: $screeningStatus")
+                      append('\n')
+                      append("Optional Call Log fallback: $callLogStatus")
+                      append('\n')
+                      append("Battery optimization exemption: $batteryStatus")
+                      append('\n')
+                      append("Primary path: Call Screening role. Fallback path: PHONE_STATE receiver when Android provides the incoming number.")
+                  }
+              }
+          
+              private fun requestRequiredPermissions() {
+                  if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
+                  val missing = PermissionGate.missingRequired(this)
+                  if (missing.isNotEmpty()) {
+                      requestPermissions(missing.toTypedArray(), REQUEST_REQUIRED_PERMISSIONS)
+                  }
+              }
+          
+              private fun requestOptionalCallLogPermission() {
+                  if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
+                  val missing = PermissionGate.missingOptional(this)
+                  if (missing.isNotEmpty()) {
+                      requestPermissions(missing.toTypedArray(), REQUEST_OPTIONAL_PERMISSIONS)
+                  }
+              }
+          
+              private fun requestCallScreeningRole() {
+                  if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
+                  val roleManager = getSystemService(RoleManager::class.java) ?: return
+                  if (!roleManager.isRoleAvailable(RoleManager.ROLE_CALL_SCREENING)) return
+                  if (roleManager.isRoleHeld(RoleManager.ROLE_CALL_SCREENING)) return
+                  startActivityForResult(
+                      roleManager.createRequestRoleIntent(RoleManager.ROLE_CALL_SCREENING),
+                      REQUEST_CALL_SCREENING_ROLE
+                  )
+              }
+          
+              private fun isCallScreeningRoleAvailable(): Boolean {
+                  if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return false
+                  val roleManager = getSystemService(RoleManager::class.java) ?: return false
+                  return roleManager.isRoleAvailable(RoleManager.ROLE_CALL_SCREENING)
+              }
+          
+              private fun isCallScreeningRoleHeld(): Boolean {
+                  if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return false
+                  val roleManager = getSystemService(RoleManager::class.java) ?: return false
+                  return roleManager.isRoleHeld(RoleManager.ROLE_CALL_SCREENING)
+              }
+          
+              private fun requestBatteryOptimizationExemption() {
+                  if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
+                  if (isIgnoringBatteryOptimizations()) return
+          
+                  val packageUri = Uri.parse("package:$packageName")
+                  val directIntent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                      data = packageUri
+                  }
+                  try {
+                      startActivity(directIntent)
+                  } catch (_: ActivityNotFoundException) {
+                      val fallbackIntent = Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+                      startActivity(fallbackIntent)
+                  }
+              }
+          
+              private fun openAppSettings() {
+                  val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                      data = Uri.parse("package:$packageName")
+                  }
+                  startActivity(intent)
+              }
+          
+              private fun isIgnoringBatteryOptimizations(): Boolean {
+                  if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return true
+                  val powerManager = getSystemService(PowerManager::class.java) ?: return false
+                  return powerManager.isIgnoringBatteryOptimizations(packageName)
+              }
+          
+              private fun button(text: String, onClick: () -> Unit): Button = Button(this).apply {
+                  this.text = text
+                  setOnClickListener { onClick() }
+              }
+          
+              private fun matchWrap(): LinearLayout.LayoutParams = LinearLayout.LayoutParams(
+                  ViewGroup.LayoutParams.MATCH_PARENT,
+                  ViewGroup.LayoutParams.WRAP_CONTENT
+              ).apply {
+                  bottomMargin = (8 * resources.displayMetrics.density).toInt()
+              }
+          
+              companion object {
+                  private const val REQUEST_REQUIRED_PERMISSIONS = 1001
+                  private const val REQUEST_OPTIONAL_PERMISSIONS = 1002
+                  private const val REQUEST_CALL_SCREENING_ROLE = 1003
+              }
+          }
+          __CALLER_ANNOUNCER_FILE__
+
+          mkdir -p app/src/main/java/dev/callerannouncer
+          cat > app/src/main/java/dev/callerannouncer/PermissionGate.kt <<'__CALLER_ANNOUNCER_FILE__'
+          package dev.callerannouncer
+          
+          import android.Manifest
+          import android.content.Context
+          import android.content.pm.PackageManager
+          import android.os.Build
+          
+          object PermissionGate {
+              val requiredRuntimePermissions: Array<String>
+                  get() = arrayOf(
+                      Manifest.permission.READ_PHONE_STATE,
+                      Manifest.permission.READ_CONTACTS
+                  )
+          
+              val optionalRuntimePermissions: Array<String>
+                  get() = arrayOf(Manifest.permission.READ_CALL_LOG)
+          
+              val allRuntimePermissions: Array<String>
+                  get() = requiredRuntimePermissions + optionalRuntimePermissions
+          
+              fun missingRequired(context: Context): List<String> = missing(context, requiredRuntimePermissions)
+          
+              fun missingOptional(context: Context): List<String> = missing(context, optionalRuntimePermissions)
+          
+              fun hasRequiredRuntimePermissions(context: Context): Boolean = missingRequired(context).isEmpty()
+          
+              fun hasContactPermission(context: Context): Boolean = hasPermission(context, Manifest.permission.READ_CONTACTS)
+          
+              fun hasPhoneStatePermission(context: Context): Boolean = hasPermission(context, Manifest.permission.READ_PHONE_STATE)
+          
+              fun hasCallLogPermission(context: Context): Boolean = hasPermission(context, Manifest.permission.READ_CALL_LOG)
+          
+              private fun missing(context: Context, permissions: Array<String>): List<String> = permissions.filterNot {
+                  hasPermission(context, it)
+              }
+          
+              private fun hasPermission(context: Context, permission: String): Boolean {
+                  return Build.VERSION.SDK_INT < Build.VERSION_CODES.M ||
+                      context.checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED
+              }
+          }
+          __CALLER_ANNOUNCER_FILE__
+
+      - name: Build debug APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          gradle :app:assembleDebug --no-daemon --stacktrace
+          mkdir -p out
+          cp app/build/outputs/apk/debug/app-debug.apk out/CallerAnnouncer-debug.apk
+          ls -lh out/CallerAnnouncer-debug.apk
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CallerAnnouncer-debug-apk
+          path: out/CallerAnnouncer-debug.apk
+          retention-days: 14
