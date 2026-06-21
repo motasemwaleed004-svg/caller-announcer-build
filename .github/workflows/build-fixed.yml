@@ -28,13 +28,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          git show e0057eb:.github/workflows/build.yml > /tmp/original-build.yml
           awk '
             /      - name: Write embedded Android project/ { found=1; next }
             found && /      - name: Build debug APK/ { exit }
             found && /^        shell: bash/ { next }
             found && /^        run: \|/ { inrun=1; next }
             found && inrun { sub(/^          /, ""); print }
-          ' .github/workflows/build.yml > /tmp/write-project.sh
+          ' /tmp/original-build.yml > /tmp/write-project.sh
           bash /tmp/write-project.sh
           test -f settings.gradle.kts
           test -f app/build.gradle.kts
@@ -43,7 +44,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git show HEAD^:.github/workflows/build-fixed.yml > /tmp/previous-build-fixed.yml
+          git show d66f92febbac58fa3fee5d82721a33e48524e8dc:.github/workflows/build-fixed.yml > /tmp/previous-build-fixed.yml
           awk '
             /      - name: Apply repeat-call and Arabic Franco fix/ { found=1; next }
             found && /      - name: Set up Gradle/ { exit }
