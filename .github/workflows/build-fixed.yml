@@ -37,6 +37,717 @@ jobs:
           test -f settings.gradle.kts
           test -f app/build.gradle.kts
 
+      - name: Apply repeat-call and Arabic Franco fix
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > app/src/main/java/dev/callerannouncer/CallerAnnouncementScheduler.kt <<'__CALLER_ANNOUNCER_FILE__'
+          package dev.callerannouncer
+
+          import android.Manifest
+          import android.content.Context
+          import android.content.pm.PackageManager
+          import android.os.Build
+          import android.os.SystemClock
+          import android.telephony.TelephonyManager
+          import android.util.Log
+          import kotlinx.coroutines.CoroutineScope
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.SupervisorJob
+          import kotlinx.coroutines.async
+          import kotlinx.coroutines.delay
+          import kotlinx.coroutines.launch
+          import java.util.concurrent.atomic.AtomicLong
+
+          object CallerAnnouncementScheduler {
+              private const val TAG = "CallerAnnouncement"
+              private const val ONE_SECOND_MS = 1000L
+
+              private const val DUPLICATE_SOURCE_WINDOW_MS = 1500L
+
+              private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+              private val nextEventId = AtomicLong(0L)
+              private val lock = Any()
+
+              private var lastAnnouncementKey: String? = null
+              private var lastAnnouncementAt: Long = 0L
+
+              fun schedule(
+                  context: Context,
+                  incomingNumber: String,
+                  source: String,
+                  completion: (() -> Unit)? = null
+              ) {
+                  val appContext = context.applicationContext
+                  val number = incomingNumber.trim()
+                  if (number.isBlank()) {
+                      completion?.invoke()
+                      return
+                  }
+                  if (!PermissionGate.hasRequiredRuntimePermissions(appContext)) {
+                      completion?.invoke()
+                      return
+                  }
+
+                  val key = number
+                  val now = SystemClock.elapsedRealtime()
+                  synchronized(lock) {
+                      if (lastAnnouncementKey == key && now - lastAnnouncementAt < DUPLICATE_SOURCE_WINDOW_MS) {
+                          completion?.invoke()
+                          return
+                      }
+                      lastAnnouncementKey = key
+                      lastAnnouncementAt = now
+                  }
+
+                  val eventId = nextEventId.incrementAndGet()
+                  scope.launch {
+                      try {
+                          Log.d(TAG, "Scheduled caller announcement from $source")
+                          val startedAt = SystemClock.elapsedRealtime()
+                          val contactNameDeferred = async(Dispatchers.IO) {
+                              ContactLookup.displayNameForNumber(appContext, number)
+                          }
+
+                          val contactName = contactNameDeferred.await()?.trim()
+                          val elapsed = SystemClock.elapsedRealtime() - startedAt
+                          val remainingDelay = ONE_SECOND_MS - elapsed
+                          if (remainingDelay > 0L) delay(remainingDelay)
+
+                          if (!isStillLatest(eventId, key)) return@launch
+                          if (!isStillRinging(appContext)) return@launch
+
+                          if (!contactName.isNullOrBlank()) {
+                              CallerSpeaker.speakName(appContext, contactName)
+                          }
+                      } catch (t: Throwable) {
+                          Log.w(TAG, "Caller announcement failed", t)
+                      } finally {
+                          completion?.invoke()
+                      }
+                  }
+              }
+
+              fun reset() {
+                  synchronized(lock) {
+                      lastAnnouncementKey = null
+                      lastAnnouncementAt = 0L
+                      nextEventId.incrementAndGet()
+                  }
+                  CallerSpeaker.stop()
+              }
+
+              private fun isStillLatest(eventId: Long, key: String): Boolean = synchronized(lock) {
+                  eventId == nextEventId.get() && lastAnnouncementKey == key
+              }
+
+              private fun isStillRinging(context: Context): Boolean {
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
+                      context.checkSelfPermission(Manifest.permission.READ_PHONE_STATE) != PackageManager.PERMISSION_GRANTED
+                  ) return false
+
+                  val telephonyManager = context.getSystemService(TelephonyManager::class.java) ?: return true
+                  return runCatching {
+                      @Suppress("DEPRECATION")
+                      telephonyManager.callState == TelephonyManager.CALL_STATE_RINGING
+                  }.getOrDefault(true)
+              }
+          }
+          __CALLER_ANNOUNCER_FILE__
+
+          cat > app/src/main/java/dev/callerannouncer/CallerNameNormalizer.kt <<'__CALLER_ANNOUNCER_FILE__'
+          package dev.callerannouncer
+
+          import java.text.Normalizer
+          import java.util.Locale
+
+          data class SpokenCallerName(
+              val text: String,
+              val locale: Locale
+          )
+
+          object CallerNameNormalizer {
+              private val arabicLocale: Locale = Locale("ar", "EG")
+              private val arabicLetters = Regex("[\\u0600-\\u06FF]")
+              private val latinToken = Regex("[A-Za-z0-9']+|[^A-Za-z0-9']+")
+              private val arabiziMarker = Regex("[2356789]|3'|gh|kh|sh|7", RegexOption.IGNORE_CASE)
+
+              private val exactNames: Map<String, String> = linkedMapOf(
+                  "mohamed" to "محمد",
+                  "mohammad" to "محمد",
+                  "mohammed" to "محمد",
+                  "muhammad" to "محمد",
+                  "muhammed" to "محمد",
+                  "mo7amed" to "محمد",
+                  "mo7amad" to "محمد",
+                  "mo7ammed" to "محمد",
+                  "m7md" to "محمد",
+                  "m7mad" to "محمد",
+                  "mhmd" to "محمد",
+                  "mohmd" to "محمد",
+                  "ahmed" to "أحمد",
+                  "ahmad" to "أحمد",
+                  "a7med" to "أحمد",
+                  "a7mad" to "أحمد",
+                  "mahmoud" to "محمود",
+                  "mahmood" to "محمود",
+                  "mahmud" to "محمود",
+                  "ma7moud" to "محمود",
+                  "ma7mod" to "محمود",
+                  "mostafa" to "مصطفى",
+                  "moustafa" to "مصطفى",
+                  "mustafa" to "مصطفى",
+                  "mostfa" to "مصطفى",
+                  "ali" to "علي",
+                  "aly" to "علي",
+                  "3ly" to "علي",
+                  "3ali" to "علي",
+                  "alaa" to "علاء",
+                  "3laa" to "علاء",
+                  "3alaa" to "علاء",
+                  "ala2" to "علاء",
+                  "alaa2" to "علاء",
+                  "omar" to "عمر",
+                  "3omar" to "عمر",
+                  "amr" to "عمرو",
+                  "3amr" to "عمرو",
+                  "amro" to "عمرو",
+                  "3amro" to "عمرو",
+                  "hassan" to "حسن",
+                  "hasan" to "حسن",
+                  "7assan" to "حسن",
+                  "7asan" to "حسن",
+                  "hussein" to "حسين",
+                  "hussien" to "حسين",
+                  "hossein" to "حسين",
+                  "7ussein" to "حسين",
+                  "7ussien" to "حسين",
+                  "hossam" to "حسام",
+                  "hosam" to "حسام",
+                  "7ossam" to "حسام",
+                  "ibrahim" to "إبراهيم",
+                  "ebrahim" to "إبراهيم",
+                  "youssef" to "يوسف",
+                  "yousef" to "يوسف",
+                  "yusuf" to "يوسف",
+                  "yussif" to "يوسف",
+                  "yassin" to "ياسين",
+                  "yassen" to "ياسين",
+                  "kareem" to "كريم",
+                  "karim" to "كريم",
+                  "kreem" to "كريم",
+                  "ramy" to "رامي",
+                  "rami" to "رامي",
+                  "hany" to "هاني",
+                  "hani" to "هاني",
+                  "tarek" to "طارق",
+                  "tariq" to "طارق",
+                  "khaled" to "خالد",
+                  "khalid" to "خالد",
+                  "5aled" to "خالد",
+                  "waleed" to "وليد",
+                  "walid" to "وليد",
+                  "sayed" to "سيد",
+                  "said" to "سعيد",
+                  "saeed" to "سعيد",
+                  "salah" to "صلاح",
+                  "saleh" to "صالح",
+                  "sherif" to "شريف",
+                  "shereef" to "شريف",
+                  "ehab" to "إيهاب",
+                  "ihab" to "إيهاب",
+                  "islam" to "إسلام",
+                  "eslam" to "إسلام",
+                  "belal" to "بلال",
+                  "bilal" to "بلال",
+                  "adel" to "عادل",
+                  "3adel" to "عادل",
+                  "ashraf" to "أشرف",
+                  "samy" to "سامي",
+                  "sami" to "سامي",
+                  "fady" to "فادي",
+                  "fadi" to "فادي",
+                  "mina" to "مينا",
+                  "george" to "جورج",
+                  "peter" to "بيتر",
+                  "ziad" to "زياد",
+                  "zeyad" to "زياد",
+                  "seif" to "سيف",
+                  "saif" to "سيف",
+                  "adham" to "أدهم",
+                  "osama" to "أسامة",
+                  "usama" to "أسامة",
+                  "basem" to "باسم",
+                  "basim" to "باسم",
+                  "maged" to "ماجد",
+                  "magdy" to "مجدي",
+                  "hatem" to "حاتم",
+                  "hazem" to "حازم",
+                  "fawzy" to "فوزي",
+                  "fathy" to "فتحي",
+                  "gamal" to "جمال",
+                  "jamal" to "جمال",
+                  "kamal" to "كمال",
+                  "wael" to "وائل",
+                  "medhat" to "مدحت",
+                  "moataz" to "معتز",
+                  "motaz" to "معتز",
+                  "mo3taz" to "معتز",
+                  "moamen" to "مؤمن",
+                  "momen" to "مؤمن",
+                  "mo2men" to "مؤمن",
+                  "abdallah" to "عبد الله",
+                  "abdullah" to "عبد الله",
+                  "abdelrahman" to "عبد الرحمن",
+                  "abdelrhman" to "عبد الرحمن",
+                  "abd" to "عبد",
+                  "abdel" to "عبد",
+                  "allah" to "الله",
+                  "rahman" to "الرحمن",
+                  "samir" to "سمير",
+                  "soliman" to "سليمان",
+                  "suleiman" to "سليمان",
+                  "mansour" to "منصور",
+                  "sobhy" to "صبحي",
+                  "eid" to "عيد",
+                  "sara" to "سارة",
+                  "sarah" to "سارة",
+                  "mariam" to "مريم",
+                  "maryam" to "مريم",
+                  "meriem" to "مريم",
+                  "aya" to "آية",
+                  "ayah" to "آية",
+                  "nour" to "نور",
+                  "noor" to "نور",
+                  "nor" to "نور",
+                  "nada" to "ندى",
+                  "rana" to "رنا",
+                  "reem" to "ريم",
+                  "rim" to "ريم",
+                  "mai" to "مي",
+                  "may" to "مي",
+                  "menna" to "منة",
+                  "mena" to "منة",
+                  "mona" to "منى",
+                  "muna" to "منى",
+                  "dina" to "دينا",
+                  "deena" to "دينا",
+                  "salma" to "سلمى",
+                  "shimaa" to "شيماء",
+                  "shymaa" to "شيماء",
+                  "esraa" to "إسراء",
+                  "israa" to "إسراء",
+                  "esra" to "إسراء",
+                  "isra" to "إسراء",
+                  "doaa" to "دعاء",
+                  "do3a" to "دعاء",
+                  "do3aa" to "دعاء",
+                  "hager" to "هاجر",
+                  "hagar" to "هاجر",
+                  "hana" to "هنا",
+                  "hanaa" to "هناء",
+                  "jana" to "جنى",
+                  "janna" to "جنة",
+                  "farah" to "فرح",
+                  "basma" to "بسمة",
+                  "nesma" to "نسمة",
+                  "nisma" to "نسمة",
+                  "yasmin" to "ياسمين",
+                  "yasmine" to "ياسمين",
+                  "jasmine" to "ياسمين",
+                  "eman" to "إيمان",
+                  "iman" to "إيمان",
+                  "habiba" to "حبيبة",
+                  "7abiba" to "حبيبة",
+                  "hoda" to "هدى",
+                  "huda" to "هدى",
+                  "fatma" to "فاطمة",
+                  "fatima" to "فاطمة",
+                  "ganna" to "جنة",
+                  "jannah" to "جنة",
+                  "malak" to "ملك",
+                  "marwa" to "مروة",
+                  "asmaa" to "أسماء",
+                  "asma" to "أسماء",
+                  "heba" to "هبة",
+                  "hiba" to "هبة",
+                  "manar" to "منار",
+                  "shahd" to "شهد",
+                  "rawan" to "روان",
+                  "rowan" to "روان",
+                  "nourhan" to "نورهان",
+                  "mama" to "ماما",
+                  "mamy" to "مامي",
+                  "mami" to "مامي",
+                  "baba" to "بابا",
+                  "papa" to "بابا",
+                  "teta" to "تيتا",
+                  "gedo" to "جدو",
+                  "gido" to "جدو",
+                  "tante" to "طنط"
+              )
+
+              fun prepareForSpeech(rawName: String): SpokenCallerName? {
+                  val cleaned = rawName.replace(Regex("\\s+"), " ").trim()
+                  if (cleaned.isBlank()) return null
+
+                  if (arabicLetters.containsMatchIn(cleaned)) {
+                      return SpokenCallerName(cleaned, arabicLocale)
+                  }
+
+                  val fullKey = keyFor(cleaned)
+                  exactNames[fullKey]?.let { return SpokenCallerName(it, arabicLocale) }
+
+                  val converted = convertLatinName(cleaned)
+                  return if (converted != cleaned) {
+                      SpokenCallerName(converted, arabicLocale)
+                  } else {
+                      SpokenCallerName(cleaned, Locale.getDefault())
+                  }
+              }
+
+              private fun convertLatinName(name: String): String {
+                  var changed = false
+                  val converted = latinToken.findAll(name).joinToString(separator = "") { match ->
+                      val part = match.value
+                      if (part.any { it.isLetterOrDigit() }) {
+                          val newPart = convertToken(part)
+                          if (newPart != part) changed = true
+                          newPart
+                      } else {
+                          part
+                      }
+                  }
+                  return if (changed) converted else name
+              }
+
+              private fun convertToken(token: String): String {
+                  exactNames[keyFor(token)]?.let { return it }
+                  if (!arabiziMarker.containsMatchIn(token)) return token
+                  return arabiziFallback(token)
+              }
+
+              private fun keyFor(value: String): String {
+                  val normalized = Normalizer.normalize(value, Normalizer.Form.NFD)
+                      .replace(Regex("\\p{Mn}+"), "")
+                  return normalized.lowercase(Locale.US).replace(Regex("[^a-z0-9]+"), "")
+              }
+
+              private fun arabiziFallback(token: String): String {
+                  var s = token.lowercase(Locale.US)
+                  s = s.replace("3'", "غ")
+                      .replace("gh", "غ")
+                      .replace("kh", "خ")
+                      .replace("sh", "ش")
+                      .replace("ch", "ش")
+                      .replace("th", "ث")
+                      .replace("dh", "ذ")
+
+                  val out = StringBuilder()
+                  var index = 0
+                  while (index < s.length) {
+                      val c = s[index]
+                      if (c in '\u0600'..'\u06FF') {
+                          out.append(c)
+                          index++
+                          continue
+                      }
+
+                      val next = s.getOrNull(index + 1)
+                      when (c) {
+                          '2' -> out.append('ء')
+                          '3' -> out.append('ع')
+                          '5' -> out.append('خ')
+                          '6' -> out.append('ط')
+                          '7' -> out.append('ح')
+                          '8' -> out.append('غ')
+                          '9' -> out.append('ص')
+                          'a' -> {
+                              out.append(if (out.isEmpty()) 'أ' else 'ا')
+                              if (next == 'a') index++
+                          }
+                          'e', 'i', 'y' -> {
+                              out.append('ي')
+                              if (next == c) index++
+                          }
+                          'o', 'u', 'w' -> {
+                              out.append('و')
+                              if (next == c) index++
+                          }
+                          'b' -> out.append('ب')
+                          'p' -> out.append('ب')
+                          't' -> out.append('ت')
+                          'g', 'j' -> out.append('ج')
+                          'd' -> out.append('د')
+                          'r' -> out.append('ر')
+                          'z' -> out.append('ز')
+                          's' -> out.append('س')
+                          'f', 'v' -> out.append('ف')
+                          'q' -> out.append('ق')
+                          'k', 'c' -> out.append('ك')
+                          'l' -> out.append('ل')
+                          'm' -> out.append('م')
+                          'n' -> out.append('ن')
+                          'h' -> out.append('ه')
+                      }
+                      index++
+                  }
+
+                  return out.toString().ifBlank { token }
+              }
+          }
+          __CALLER_ANNOUNCER_FILE__
+
+          cat > app/src/main/java/dev/callerannouncer/CallerSpeaker.kt <<'__CALLER_ANNOUNCER_FILE__'
+          package dev.callerannouncer
+
+          import android.content.Context
+          import android.media.AudioAttributes
+          import android.media.AudioFocusRequest
+          import android.media.AudioManager
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.os.SystemClock
+          import android.speech.tts.TextToSpeech
+          import android.speech.tts.UtteranceProgressListener
+          import android.util.Log
+          import java.util.Locale
+
+          object CallerSpeaker {
+              private const val TAG = "CallerSpeaker"
+
+              private val mainHandler = Handler(Looper.getMainLooper())
+              private val lock = Any()
+              private val pendingCallbacks = mutableListOf<(TextToSpeech) -> Unit>()
+
+              @Volatile private var tts: TextToSpeech? = null
+              @Volatile private var initInProgress = false
+
+              private var audioManager: AudioManager? = null
+              private var focusRequest: AudioFocusRequest? = null
+
+              fun warmUp(context: Context) {
+                  withTts(context.applicationContext) { engine ->
+                      configureEngineBase(engine)
+                  }
+              }
+
+              fun speakName(context: Context, rawName: String) {
+                  val prepared = CallerNameNormalizer.prepareForSpeech(rawName) ?: return
+                  val appContext = context.applicationContext
+
+                  mainHandler.post {
+                      speakPrepared(appContext, prepared, allowRetry = true)
+                  }
+              }
+
+              fun stop() {
+                  mainHandler.post {
+                      tts?.runCatching { stop() }
+                      abandonAudioFocus()
+                  }
+              }
+
+              fun shutdown() {
+                  mainHandler.post {
+                      synchronized(lock) {
+                          pendingCallbacks.clear()
+                          initInProgress = false
+                      }
+                      tts?.runCatching { stop() }
+                      tts?.runCatching { shutdown() }
+                      tts = null
+                      abandonAudioFocus()
+                  }
+              }
+
+              private fun speakPrepared(context: Context, prepared: SpokenCallerName, allowRetry: Boolean) {
+                  requestAudioFocus(context)
+                  withTts(context) { engine ->
+                      configureEngineBase(engine)
+                      configureLanguage(engine, prepared.locale)
+
+                      val params = Bundle().apply {
+                          putInt(TextToSpeech.Engine.KEY_PARAM_STREAM, AudioManager.STREAM_RING)
+                          putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, 1.0f)
+                      }
+
+                      val result = engine.speak(
+                          prepared.text,
+                          TextToSpeech.QUEUE_FLUSH,
+                          params,
+                          "caller-name-${SystemClock.uptimeMillis()}"
+                      )
+
+                      if (result != TextToSpeech.SUCCESS) {
+                          Log.w(TAG, "TextToSpeech.speak returned $result")
+                          if (allowRetry) {
+                              recreateTts(context) { retryEngine ->
+                                  configureEngineBase(retryEngine)
+                                  configureLanguage(retryEngine, prepared.locale)
+                                  retryEngine.speak(
+                                      prepared.text,
+                                      TextToSpeech.QUEUE_FLUSH,
+                                      params,
+                                      "caller-name-retry-${SystemClock.uptimeMillis()}"
+                                  )
+                              }
+                          } else {
+                              abandonAudioFocus()
+                          }
+                      }
+                  }
+              }
+
+              private fun withTts(context: Context, callback: (TextToSpeech) -> Unit) {
+                  val existing = tts
+                  if (existing != null) {
+                      callback(existing)
+                      return
+                  }
+
+                  synchronized(lock) {
+                      pendingCallbacks += callback
+                      if (initInProgress) return
+                      initInProgress = true
+                  }
+
+                  val holder = arrayOfNulls<TextToSpeech>(1)
+                  holder[0] = TextToSpeech(context.applicationContext) { status ->
+                      mainHandler.post {
+                          val callbacks: List<(TextToSpeech) -> Unit>
+                          val engine = holder[0]
+
+                          synchronized(lock) {
+                              initInProgress = false
+                              callbacks = if (status == TextToSpeech.SUCCESS && engine != null) {
+                                  tts = engine
+                                  pendingCallbacks.toList().also { pendingCallbacks.clear() }
+                              } else {
+                                  pendingCallbacks.clear()
+                                  emptyList()
+                              }
+                          }
+
+                          if (status == TextToSpeech.SUCCESS && engine != null) {
+                              configureEngineBase(engine)
+                              callbacks.forEach { it(engine) }
+                          } else {
+                              Log.w(TAG, "TextToSpeech initialization failed with status $status")
+                              engine?.runCatching { shutdown() }
+                              abandonAudioFocus()
+                          }
+                      }
+                  }
+              }
+
+              private fun recreateTts(context: Context, callback: (TextToSpeech) -> Unit) {
+                  synchronized(lock) {
+                      pendingCallbacks.clear()
+                      initInProgress = false
+                  }
+                  tts?.runCatching { stop() }
+                  tts?.runCatching { shutdown() }
+                  tts = null
+                  withTts(context, callback)
+              }
+
+              private fun configureEngineBase(engine: TextToSpeech) {
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                      val attributes = AudioAttributes.Builder()
+                          .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
+                          .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                          .build()
+                      engine.setAudioAttributes(attributes)
+                  }
+                  engine.setSpeechRate(0.95f)
+                  engine.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                      override fun onStart(utteranceId: String) = Unit
+
+                      override fun onDone(utteranceId: String) {
+                          finishSpeechSoon()
+                      }
+
+                      @Deprecated("Deprecated in Java")
+                      override fun onError(utteranceId: String) {
+                          finishSpeechSoon()
+                      }
+
+                      override fun onError(utteranceId: String, errorCode: Int) {
+                          finishSpeechSoon()
+                      }
+
+                      override fun onStop(utteranceId: String, interrupted: Boolean) {
+                          finishSpeechSoon()
+                      }
+                  })
+              }
+
+              private fun configureLanguage(engine: TextToSpeech, preferredLocale: Locale) {
+                  val candidates = listOf(
+                      preferredLocale,
+                      Locale("ar", "EG"),
+                      Locale("ar"),
+                      Locale.getDefault()
+                  ).distinct()
+
+                  for (locale in candidates) {
+                      val result = engine.setLanguage(locale)
+                      if (result != TextToSpeech.LANG_MISSING_DATA &&
+                          result != TextToSpeech.LANG_NOT_SUPPORTED
+                      ) {
+                          return
+                      }
+                  }
+              }
+
+              private fun requestAudioFocus(context: Context) {
+                  val manager = context.getSystemService(AudioManager::class.java) ?: return
+                  audioManager = manager
+                  abandonAudioFocus()
+
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      val attributes = AudioAttributes.Builder()
+                          .setUsage(AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
+                          .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                          .build()
+                      val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+                          .setAudioAttributes(attributes)
+                          .setWillPauseWhenDucked(false)
+                          .setOnAudioFocusChangeListener { }
+                          .build()
+                      focusRequest = request
+                      manager.requestAudioFocus(request)
+                  } else {
+                      @Suppress("DEPRECATION")
+                      manager.requestAudioFocus(
+                          null,
+                          AudioManager.STREAM_RING,
+                          AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK
+                      )
+                  }
+              }
+
+              private fun finishSpeechSoon() {
+                  mainHandler.postDelayed({ abandonAudioFocus() }, 300L)
+              }
+
+              private fun abandonAudioFocus() {
+                  val manager = audioManager ?: return
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      focusRequest?.let(manager::abandonAudioFocusRequest)
+                      focusRequest = null
+                  } else {
+                      @Suppress("DEPRECATION")
+                      manager.abandonAudioFocus(null)
+                  }
+              }
+          }
+          __CALLER_ANNOUNCER_FILE__
+
       - name: Set up Gradle 8.10.2
         uses: gradle/actions/setup-gradle@v6
         with:
