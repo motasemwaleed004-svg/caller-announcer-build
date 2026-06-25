@@ -55,7 +55,7 @@ jobs:
           bash /tmp/apply-base-fix.sh
           test -f app/src/main/java/dev/callerannouncer/CallerNameNormalizer.kt
 
-      - name: Apply 850ms digit rules and visible-number fallback
+      - name: Apply 1200ms stable pronunciation rules
         shell: bash
         run: |
           set -euo pipefail
@@ -65,7 +65,7 @@ jobs:
 
           scheduler = Path('app/src/main/java/dev/callerannouncer/CallerAnnouncementScheduler.kt')
           s = scheduler.read_text()
-          s = re.sub(r'private const val ONE_SECOND_MS = \d+L', 'private const val ANNOUNCE_DELAY_MS = 850L', s)
+          s = re.sub(r'private const val ONE_SECOND_MS = \d+L', 'private const val ANNOUNCE_DELAY_MS = 1200L', s)
           s = s.replace('ONE_SECOND_MS - elapsed', 'ANNOUNCE_DELAY_MS - elapsed')
           s = re.sub(
               r'(?P<i>\s*)if \(!contactName\.isNullOrBlank\(\)\) \{\s*CallerSpeaker\.speakName\(appContext, contactName\)\s*\}',
@@ -127,12 +127,14 @@ jobs:
               fun stop() {''',
                   1,
               )
+          p = p.replace('engine.setSpeechRate(0.95f)', 'engine.setSpeechRate(0.90f)')
           speaker.write_text(p)
           PY
 
-          grep -R "ANNOUNCE_DELAY_MS = 850L" app/src/main/java/dev/callerannouncer/CallerAnnouncementScheduler.kt
+          grep -R "ANNOUNCE_DELAY_MS = 1200L" app/src/main/java/dev/callerannouncer/CallerAnnouncementScheduler.kt
           grep -R "token.all" app/src/main/java/dev/callerannouncer/CallerNameNormalizer.kt
           grep -R "speakDigits" app/src/main/java/dev/callerannouncer
+          grep -R "setSpeechRate(0.90f)" app/src/main/java/dev/callerannouncer/CallerSpeaker.kt
 
       - name: Set up Gradle 8.10.2
         uses: gradle/actions/setup-gradle@v6
